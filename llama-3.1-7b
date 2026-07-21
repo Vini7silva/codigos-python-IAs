@@ -1,0 +1,178 @@
+import os
+import sys
+import threading
+import time
+import requests
+import pyttsx3
+import sounddevice as sd
+import numpy as np
+from scipy.signal import resample
+from piper import PiperVoice
+from openai import OpenAI
+
+LM_STUDIO_URL = "http://localhost:1234/v1" 
+MODELO_LOCAL = "meta-llama-3.1-8b-instruct"
+PASTA_CONHECIMENTO = os.path.join(os.path.expanduser("~"), "Desktop", "conhecimento")
+SYSTEM_PROMPT = "Você é uma inteligência artificial avançada com conhecimento enciclopédico. Responda sempre em português brasileiro de forma clara, completa e amigável. Utilize os dados do [CONHECIMENTO ADICIONAL] fornecido para enriquecer sua resposta com fatos reais, precisos e enciclopédicos sempre que houver dados relevantes."
+
+historico = []
+interrompido = False 
+client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio-local")
+
+BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
+voice = None
+
+try:
+    for arquivo in os.listdir(BASE_DIR):
+        if arquivo.startswith("pt_BR-faber"):
+            caminho_completo = os.path.join(BASE_DIR, arquivo)
+            try:
+                voice = PiperVoice.load(caminho_completo)
+                if voice is not None:
+                    break
+            except Exception: pass
+except Exception: pass
+
+def buscar_enciclopedia_local(pergunta):
+    if not os.path.exists(PASTA_CONHECIMENTO): return ""
+    trechos_relevantes = []
+    palavras_busca = [p.lower() for p in pergunta.split() if len(p) > 3]
+    try:
+        list_arquivos = [f for f in os.listdir(PASTA_CONHECIMENTO) if f.endswith(".txt")]
+    except Exception: return ""
+    if not list_arquivos: return ""
+    for arquivo in list_arquivos:
+        caminho = os.path.join(PASTA_CONHECIMENTO, arquivo)
+        try:
+            with open(caminho, "r", encoding="utf-8") as f:
+                paragrafos = f.read().split("\n\n")
+                for para in paragrafos:
+                    para_clean = para.strip()
+                    if not para_clean: continue
+                    correspondencias = sum(1 for p in palavras_busca if p in para_clean.lower())
+                    if correspondencias > 0: trechos_relevantes.append((correspondencias, para_clean))
+        except Exception: continue
+    if not trechos_relevantes: return ""
+    trechos_relevantes.sort(key=lambda x: x, reverse=True)
+    contexto_final = "\n".join([texto for _, texto in trechos_relevantes[:4]])
+    print(f"\n 📚 [RAG] Alimentando modelo com contexto extraído dos seus arquivos...")
+    return f"\n\n[CONHECIMENTO ADICIONAL EXTRAÍDO DOS SEUS ARQUIVOS LOCAIS]:\n{contexto_final}\n"
+
+def falar_fallback_windows(texto):
+    try:
+        engine = pyttsx3.init(driverName='sapi5')
+        voices = engine.getProperty('voices')
+        for v in voices:
+            if "pt-BR" in v.id or "brazil" in v.name.lower():
+                engine.setProperty('voice', v.id)
+                break
+        engine.setProperty('rate', 200)
+        engine.say(texto)
+        engine.runAndWait()
+        engine.stop()
+    except Exception: pass
+
+def falar(texto):
+    global interrompido
+    if interrompido: return
+    texto_limpo = texto.strip()
+    if not texto_limpo or "<|" in texto_limpo or "parameters" in texto_limpo: return 
+    
+    if voice is not None:
+        try:
+            audio_stream = voice.synthesize_stream(texto_limpo)
+            audio_data = b"".join(audio_stream)
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            taxa_original = voice.config.sample_rate if hasattr(voice, 'config') else 22050
+            num_samples = int(len(audio_np) * 44100 / taxa_original)
+            audio_resampled = resample(audio_np, num_samples).astype(np.int16)
+            sd.play(audio_resampled, samplerate=44100)
+            sd.wait()
+            return
+        except Exception: pass
+        
+    falar_fallback_windows(texto_limpo)
+
+def _e_fim_de_frase(char, buffer):
+    return char in ".!?:" and len(buffer.strip()) > 20
+
+def perguntar_ia_local_streaming(pergunta):
+    global interrompido
+    interrompido = False
+    contexto_extra = buscar_enciclopedia_local(pergunta)
+    historico.append({"role": "user", "content": pergunta})
+    mensagens = [{"role": "system", "content": SYSTEM_PROMPT + contexto_extra}] + historico
+    stream = client.chat.completions.create(
+        model=MODELO_LOCAL,
+        messages=mensagens,
+        temperature=0.5,
+        max_tokens=1500,
+        stream=True,
+    )
+    resposta_completa = ""
+    buffer_frase = ""
+    print("-" * 60)
+    print("IA LOCAL (RTX + MOTOR AUDIO OFFLINE):")
+    try:
+        for chunk in stream:
+            if interrompido: break
+            if not chunk.choices: continue
+            
+            # CORREÇÃO CIRÚRGICA CRÍTICA: Adicionado o índice [0] para fixar o erro de lista
+            delta = chunk.choices[0].delta.content
+            if delta is None: continue
+            if any(tag in delta for tag in ["<|eot_id|>", "<|im_end|>", "<|start_header_id|>", "<|end_header_id|>"]): break
+            print(delta, end="", flush=True)
+            resposta_completa += delta
+            buffer_frase += delta
+            if any(_e_fim_de_frase(c, buffer_frase) for c in delta):
+                frase = buffer_frase.strip()
+                buffer_frase = ""
+                if frase and not interrompido:
+                    t = threading.Thread(target=falar, args=(frase,), daemon=True)
+                    t.start()
+                    t.join() 
+        resto_texto = buffer_frase.strip()
+        if resto_texto and not interrompido: falar(resto_texto)
+    except KeyboardInterrupt:
+        print("\n\n [Fala interrompida] ⏹️")
+        interrompido = True
+    print("\n" + "-" * 60)
+    print()
+    if not interrompido:
+        texto_limpo_final = resposta_completa.strip()
+        if texto_limpo_final: historico.append({"role": "assistant", "content": texto_limpo_final})
+        if len(historico) > 30: del historico[:2]
+
+def limpar_tela(): os.system("cls")
+def banner():
+    print("=" * 60)
+    print(" 🤖 IA CYBERPUNK LOCAL — WINDOWS EDITION | RTX 8GB")
+    print(" ⚡ Sistema Blindado Contra Erros de Lista e Som")
+    print("=" * 60)
+
+def main():
+    if not os.path.exists(PASTA_CONHECIMENTO): os.makedirs(PASTA_CONHECIMENTO)
+    limpar_tela()
+    banner()
+    if voice is None:
+        print(" 🎙️ Carregando em modo de Fallback de Voz Nocal. Pronto para conversar!")
+    else:
+        print(" 🎙️ Motor Piper carregado com sucesso. Pronto para conversar!")
+    while True:
+        try:
+            pergunta = input("Você: ").strip()
+        except KeyboardInterrupt:
+            print("\n\n Encerrando sistema local. Até logo!")
+            sys.exit(0)
+        if not pergunta: continue
+        if pergunta.lower() == "sair": break
+        if pergunta.lower() == "limpar": limpar_tela(); banner(); continue
+        print("\n ⏹️ Gerando resposta na GPU...\n")
+        try:
+            perguntar_ia_local_streaming(pergunta)
+        except Exception as e:
+            print(f" [ERRO LOCAL] Detalhes: {e}\n")
+
+if __name__ == "__main__":
+    main()
