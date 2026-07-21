@@ -1,2 +1,4 @@
-# LLma-3.1-7b.python
-codigo python para llma 3.1-7b em LM studio
+# Codigos python para IAs
+Llma 3.1-7b em LM studio
+Qwen2.5 v1 7b
+Gemma 3 12b
